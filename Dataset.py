@@ -16,7 +16,7 @@ from random import Random, random
 import sys
 import os
 import numpy
-import theano
+import functools
 
 from Log import log
 from EngineBatch import Batch, BatchSetGenerator
@@ -55,7 +55,8 @@ class Dataset(object):
 
   def __init__(self, name=None,
                window=1, context_window=None, chunking=None,
-               seq_ordering='default', shuffle_frames_of_nseqs=0, min_chunk_size=0,
+               seq_ordering='default', partition_epoch=None,
+               shuffle_frames_of_nseqs=0, min_chunk_size=0,
                estimated_num_seqs=None,):
     """
     :param str name: e.g. "train" or "eval"
@@ -65,15 +66,17 @@ class Dataset(object):
     :param None|str|int|(int,int)|dict|(dict,dict) chunking: "chunk_size:chunk_step"
     :param str seq_ordering: "batching"-option in config. e.g. "default", "sorted" or "random".
       See self.get_seq_order_for_epoch() for more details.
+    :param int|None partition_epoch:
     :param int shuffle_frames_of_nseqs: shuffles the frames. not always supported
     :param None|int estimated_num_seqs: for progress reporting in case the real num_seqs is unknown
     """
-    self.name = name or ("dataset_%s" % id(self))
+    self.name = name or ("dataset_id%s" % id(self))
     self.lock = RLock()  # Used when manipulating our data potentially from multiple threads.
     self.num_inputs = 0  # usually not used, but num_outputs instead, which is more generic
     self.num_outputs = None; " :type: dict[str,(int,int)] "  # tuple is num-classes, len(shape).
     self.window = window
     self.seq_ordering = seq_ordering  # "default", "sorted" or "random". See self.get_seq_order_for_epoch().
+    self.partition_epoch = partition_epoch or 1
     self.timestamps = None
     self.labels = {}; """ :type: dict[str,list[str]] """
     self.nbytes = 0
@@ -267,10 +270,19 @@ class Dataset(object):
       seq_index.sort(key=get_seq_len, reverse=True)  # sort by length, in reverse, starting with longest
     elif self.seq_ordering.startswith('laplace'):
       assert get_seq_len
-      tmp = self.seq_ordering.split(':')
-      bins = int(tmp[1]) if len(tmp) > 1 else 2
-      nth = int(tmp[2]) if len(tmp) > 2 else 1
-      rnd_seed = ((epoch - 1) // nth + 1) if epoch else 1
+      tmp = self.seq_ordering.split(':')[1:]
+      if len(tmp) == 0:
+        bins = 2
+      else:
+        if tmp[0].startswith("."):  # starting with "." -> approx chunk size (num of seqs in one bin)
+          bins = max(num_seqs // int(tmp[0][1:]), 2)
+        else:  # the number of bins
+          bins = int(tmp[0])
+      if len(tmp) <= 1:
+        nth = 1
+      else:
+        nth = int(tmp[1])
+      rnd_seed = ((full_epoch - 1) // nth + 1) if full_epoch else 1
       rnd = Random(rnd_seed)
       rnd.shuffle(seq_index)
       out_index = []
@@ -279,18 +291,28 @@ class Dataset(object):
           part = seq_index[i * len(seq_index) // bins:][:]
         else:
           part = seq_index[i * len(seq_index) // bins:(i + 1) * len(seq_index) // bins][:]
-        part.sort(key=get_seq_len, reverse=(i%2 == 1))
+        part.sort(key=get_seq_len, reverse=(i % 2 == 1))
         out_index += part
       seq_index = out_index
     elif self.seq_ordering.startswith('random'):
       tmp = self.seq_ordering.split(':')
       nth = int(tmp[1]) if len(tmp) > 1 else 1
       # Keep this deterministic! Use fixed seed.
-      rnd_seed = ((epoch-1) / nth + 1) if epoch else 1
+      rnd_seed = (full_epoch - 1) / nth + 1
       rnd = Random(rnd_seed)
       rnd.shuffle(seq_index)
     else:
       assert False, "invalid batching specified: " + self.seq_ordering
+    if partition_epoch > 1:
+      current_partition = ((epoch or 1) - 1) % partition_epoch
+      seqs_per_epoch = num_seqs // partition_epoch
+      partition_sizes = ([seqs_per_epoch + 1] * (num_seqs % partition_epoch) +
+                         [seqs_per_epoch] * (partition_epoch - num_seqs % partition_epoch))
+      assert sum(partition_sizes) == num_seqs and len(partition_sizes) == partition_epoch
+      partitions = functools.reduce(lambda a, x: a + [a[-1] + x], partition_sizes, [0])  # cumulative sum
+      assert len(partitions) == partition_epoch + 1
+      seq_index = seq_index[partitions[current_partition]:partitions[current_partition + 1]]
+      assert len(seq_index) == partition_sizes[current_partition]
     return seq_index
 
   def init_seq_order(self, epoch=None, seq_list=None):
@@ -321,10 +343,10 @@ class Dataset(object):
     if int(self.window) % 2 == 0:
       self.window += 1
 
-    self.nbytes = numpy.array([], dtype=theano.config.floatX).itemsize * (self.num_inputs * self.window + 1 + 1)
+    self.nbytes = numpy.array([], dtype=numpy.float32).itemsize * (self.num_inputs * self.window + 1 + 1)
 
     if self.window > 1:
-      self.zpad = numpy.zeros((int(self.window) // 2, self.num_inputs), dtype=theano.config.floatX)
+      self.zpad = numpy.zeros((int(self.window) // 2, self.num_inputs), dtype=numpy.float32)
 
   def initialize(self):
     """
@@ -571,14 +593,14 @@ class Dataset(object):
     return " ".join(map(self.labels[key].__getitem__, data))
 
   def calculate_priori(self, target="classes"):
-    priori = numpy.zeros((self.num_outputs[target][0],), dtype=theano.config.floatX)
+    priori = numpy.zeros((self.num_outputs[target][0],), dtype=numpy.float32)
     i = 0
     while self.is_less_than_num_seqs(i):
       self.load_seqs(i, i + 1)
       for t in self.get_targets(target, i):
         priori[t] += 1
       i += 1
-    return numpy.array(priori / self.get_num_timesteps(), dtype=theano.config.floatX)
+    return numpy.array(priori / self.get_num_timesteps(), dtype=numpy.float32)
 
   def iterate_seqs(self, chunk_size=None, chunk_step=None, used_data_keys=None):
     """
@@ -839,20 +861,27 @@ def get_dataset_class(name):
   return None
 
 
-def init_dataset(kwargs, extra_kwargs=None):
+def init_dataset(kwargs, extra_kwargs=None, default_kwargs=None):
   """
   :param dict[str]|str|(()->dict[str]) kwargs:
   :param dict[str]|None extra_kwargs:
+  :param dict[str]|None default_kwargs:
   :rtype: Dataset
   """
   assert kwargs
   if callable(kwargs):
-    return init_dataset(kwargs(), extra_kwargs=extra_kwargs)
+    return init_dataset(kwargs(), extra_kwargs=extra_kwargs, default_kwargs=default_kwargs)
   if isinstance(kwargs, (str, unicode)):
     if kwargs.startswith("{"):
       kwargs = eval(kwargs)
     else:
-      return init_dataset_via_str(config_str=kwargs, **(extra_kwargs or {}))
+      config_str = kwargs
+      kwargs = {}
+      if default_kwargs:
+        kwargs.update(default_kwargs)
+      if extra_kwargs:
+        kwargs.update(extra_kwargs)
+      return init_dataset_via_str(config_str=config_str, **kwargs)
   assert isinstance(kwargs, dict)
   kwargs = kwargs.copy()
   assert "class" in kwargs
@@ -860,6 +889,9 @@ def init_dataset(kwargs, extra_kwargs=None):
   clazz = get_dataset_class(clazz_name)
   if not clazz:
     raise Exception("Dataset class %r not found" % clazz_name)
+  if default_kwargs:
+    for key, value in default_kwargs.items():
+      kwargs.setdefault(key, value)
   if extra_kwargs:
     kwargs.update(extra_kwargs)
   obj = clazz(**kwargs)
